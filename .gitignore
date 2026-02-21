@@ -1,0 +1,7 @@
+venv/
+__pycache__/
+*.pyc
+news_images/
+data/
+cache/
+.env
