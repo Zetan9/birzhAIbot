@@ -15,7 +15,7 @@ import re
 from tinkoff_stocks import TinkoffStockProvider
 from news_parser import NewsParser, NewsItem
 from database import NewsDatabase
-import ollama
+# import ollama
 import pandas as pd
 import services
 import httpx
@@ -161,16 +161,27 @@ class AIAdvisor:
                 "detailed_analysis": "развёрнутое объяснение (2-3 предложения)"
             }}
             """
-            response = ollama.chat(
-                model=self.llm_model,
-                messages=[{
-                    'role': 'user',
-                    'content': prompt,
-                    'images': [image_base64]
-                }]
-            )
-            
-            return response['message']['content']
+            url = f"{OLLAMA_HOST}/api/chat"
+            payload = {
+                "model": self.llm_model,
+                "messages": [{
+                    "role": "user",
+                    "content": prompt,
+                    "images": [image_base64]
+                }],
+                "options": {"temperature": self.TEMPERATURE},
+                "stream": False
+            }
+            try:
+                response = httpx.post(url, json=payload, timeout=30)
+                if response.status_code == 200:
+                    data = response.json()
+                    return data['message']['content']
+                else:
+                    logger.error(f"Ошибка при анализе картинки: {response.status_code}")
+            except Exception as e:
+                logger.error(f"Ошибка анализа картинки: {e}")
+            return None
         except Exception as e:
             logger.error(f"Ошибка анализа картинки: {e}")
             return None

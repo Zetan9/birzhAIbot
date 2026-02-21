@@ -11,7 +11,7 @@ import pandas as pd
 from backtester import Backtester
 import services
 import pandas as pd
-import ollama
+# import ollama
 logger = logging.getLogger(__name__)
 
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
@@ -391,13 +391,32 @@ async def analyze_ticker_command(update: Update, context: ContextTypes.DEFAULT_T
 
     # 6. Отправляем запрос к модели
     try:
-        response = ollama.chat(
-            model=advisor.llm_model,
-            messages=[{'role': 'user', 'content': prompt}],
-            options={'temperature': 0.3}
-        )
-        answer = response['message']['content']
-        await msg.edit_text(f"🧠 *Анализ {ticker}*\n\n{answer}", parse_mode='Markdown')
+        # Используем метод `_call_ollama`, который уже должен быть в `advisor`
+        result = advisor._call_ollama(prompt, temperature=0.3)
+        if result:
+            # _call_ollama возвращает словарь (распарсенный JSON) или None
+            # Здесь нужно сформировать ответ. Можно просто взять поле 'content' из результата?
+            # Но в _call_ollama мы возвращаем распарсенный JSON. Лучше переделать _call_ollama так,
+            # чтобы он возвращал полный текст ответа, если не ожидается JSON.
+            # Для простоты я предлагаю использовать другой подход: отправить запрос через httpx прямо здесь.
+            import httpx
+            from config import OLLAMA_HOST
+            url = f"{OLLAMA_HOST}/api/chat"
+            payload = {
+                "model": advisor.llm_model,
+                "messages": [{"role": "user", "content": prompt}],
+                "options": {"temperature": 0.3},
+                "stream": False
+            }
+            response = httpx.post(url, json=payload, timeout=30)
+            if response.status_code == 200:
+                data = response.json()
+                answer = data['message']['content']
+                await msg.edit_text(f"🧠 *Анализ {ticker}*\n\n{answer}", parse_mode='Markdown')
+            else:
+                await msg.edit_text(f"❌ Ошибка при анализе {ticker} (HTTP {response.status_code})")
+        else:
+            await msg.edit_text(f"❌ Не удалось получить ответ от модели")
     except Exception as e:
         logger.error(f"Ошибка при анализе {ticker}: {e}")
         await msg.edit_text(f"❌ Ошибка при анализе {ticker}")
