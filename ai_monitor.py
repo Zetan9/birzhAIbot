@@ -13,7 +13,7 @@ from ai_advisor import AIAdvisor
 from news_parser import NewsParser
 from database import NewsDatabase
 from config import TINKOFF_TOKEN
-import ollama
+# import ollama
 
 logger = logging.getLogger(__name__)
 
