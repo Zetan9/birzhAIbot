@@ -73,10 +73,169 @@ class NewsDatabase:
                     last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
+            # Таблица для хранения анализов новостей
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS news_analysis (
+                    news_id INTEGER PRIMARY KEY,
+                    source TEXT,
+                    title TEXT,
+                    published TIMESTAMP,
+                    tickers TEXT,
+                    analysis_json TEXT,
+                    sentiment_score REAL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(news_id) REFERENCES news(id) ON DELETE CASCADE
+                )
+            ''')
+            # Таблица сделок трейдера
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TIMESTAMP,
+                    ticker TEXT,
+                    action TEXT,
+                    shares INTEGER,
+                    price REAL,
+                    cost REAL,
+                    fee REAL,
+                    profit REAL,
+                    balance_after REAL,
+                    reason TEXT
+                )
+            ''')
+            # Таблица для хранения сентимента из Tinkoff Пульс (агрегированного)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS pulse_sentiment (
+                    ticker TEXT NOT NULL,
+                    date DATE NOT NULL,
+                    avg_sentiment REAL,
+                    post_count INTEGER,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (ticker, date)
+                )
+            ''')
+            # Таблица сигналов из телеграмм канала MOEX
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS moex_signals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker TEXT NOT NULL,
+                    signal_time TIMESTAMP NOT NULL,
+                    signal_type TEXT,           -- 'bullish' / 'bearish'
+                    price REAL,
+                    delta_p REAL,
+                    volume REAL,
+                    buy_pct INTEGER,
+                    sell_pct INTEGER,
+                    outcome REAL,                -- целевая переменная: 1 если успех, 0 если неудача
+                    checked_after INTERVAL,      -- через какой интервал оценивали (в секундах)
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
             
             conn.commit()
             
         logger.info("База данных инициализирована")
+
+    def save_moex_signal(self, signal_data: dict) -> int:
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO moex_signals 
+                (ticker, signal_time, signal_type, price, delta_p, volume, buy_pct, sell_pct)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                signal_data['ticker'],
+                signal_data['time'].isoformat(),
+                signal_data['type'],
+                signal_data.get('price'),
+                signal_data.get('delta_p'),
+                signal_data.get('volume'),
+                signal_data.get('buy_pct'),
+                signal_data.get('sell_pct')
+            ))
+            conn.commit()
+            return cursor.lastrowid
+
+    def update_signal_outcome(self, signal_id: int, outcome: float, checked_after: int):
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE moex_signals SET outcome = ?, checked_after = ? WHERE id = ?
+            ''', (outcome, checked_after, signal_id))
+            conn.commit()
+
+    def update_signal_model_score(self, signal_id: int, score: float):
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('UPDATE moex_signals SET model_score = ? WHERE id = ?', (score, signal_id))
+            conn.commit()
+
+    def get_unlabeled_signals(self, limit: int = 1000):
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT id, ticker, signal_time, price, signal_type FROM moex_signals
+                WHERE outcome IS NULL ORDER BY signal_time DESC LIMIT ?
+            ''', (limit,))
+            return cursor.fetchall()
+
+    def get_labeled_signals(self):
+        with sqlite3.connect(self.db_path) as conn:
+            df = pd.read_sql_query('SELECT * FROM moex_signals WHERE outcome IS NOT NULL', conn)
+        return df
+
+    def save_trade(self, trade_dict):
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO trades 
+                (timestamp, ticker, action, shares, price, cost, fee, profit, balance_after, reason)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                trade_dict['timestamp'].isoformat() if isinstance(trade_dict['timestamp'], datetime) else trade_dict['timestamp'],
+                trade_dict['ticker'],
+                trade_dict['action'],
+                trade_dict['shares'],
+                trade_dict['price'],
+                trade_dict.get('cost', 0),
+                trade_dict.get('fee', 0),
+                trade_dict.get('profit', 0),
+                trade_dict.get('balance_after', 0),
+                trade_dict.get('reason', 'manual')
+            ))
+            conn.commit()
+
+    def save_news_analysis(self, news_item, analysis_dict):
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            tickers_json = json.dumps(news_item.related_tickers, ensure_ascii=False)
+            analysis_json = json.dumps(analysis_dict, ensure_ascii=False)
+            cursor.execute('''
+                INSERT OR REPLACE INTO news_analysis 
+                (news_id, source, title, published, tickers, analysis_json, sentiment_score)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                news_item.id,  # нужно добавить id в NewsItem? или использовать link как ключ
+                news_item.source,
+                news_item.title,
+                news_item.published.isoformat(),
+                tickers_json,
+                analysis_json,
+                analysis_dict.get('sentiment_score', 0.0)
+            ))
+            conn.commit()
+
+    def get_recent_analysis_by_ticker(self, ticker, days=7, limit=5):
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT analysis_json, published FROM news_analysis
+                WHERE tickers LIKE ? AND published > datetime('now', ?)
+                ORDER BY published DESC
+                LIMIT ?
+            ''', (f'%{ticker}%', f'-{days} days', limit))
+            rows = cursor.fetchall()
+            return [json.loads(row[0]) for row in rows]
 
     def save_instruments(self, instruments: List[Dict]) -> int:
         saved = 0
@@ -309,3 +468,36 @@ class NewsDatabase:
             
             rows = cursor.fetchall()
             return [row[0] for row in rows]
+        
+    def save_pulse_sentiment(self, ticker: str, avg_sentiment: float, post_count: int):
+        """Сохраняет агрегированный сентимент для тикера за сегодня."""
+        today = datetime.now().date()
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO pulse_sentiment (ticker, date, avg_sentiment, post_count, updated_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ''', (ticker, today.isoformat(), avg_sentiment, post_count))
+            conn.commit()
+
+    def get_pulse_sentiment(self, ticker: str = None, days: int = 7) -> List[Dict]:
+        """Получает сентимент из Пульса за последние N дней. Если ticker не указан, возвращает по всем."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            if ticker:
+                cursor.execute('''
+                    SELECT ticker, date, avg_sentiment, post_count FROM pulse_sentiment
+                    WHERE ticker = ? AND date >= date('now', ?)
+                    ORDER BY date DESC
+                ''', (ticker, f'-{days} days'))
+            else:
+                cursor.execute('''
+                    SELECT ticker, date, avg_sentiment, post_count FROM pulse_sentiment
+                    WHERE date >= date('now', ?)
+                    ORDER BY ticker, date DESC
+                ''', (f'-{days} days',))
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+
+

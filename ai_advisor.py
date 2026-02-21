@@ -12,14 +12,14 @@ import os
 import time
 import base64
 import re
-from tinkoff_stocks import TinkoffStockProvider
-from news_parser import NewsParser, NewsItem
-from database import NewsDatabase
-# import ollama
+from news_parser import NewsItem
+import ollama
 import pandas as pd
 import services
 import httpx
 from config import OLLAMA_HOST
+
+# DISABLE_AI = os.getenv("DISABLE_AI", "false").lower() == "false"
 
 logger = logging.getLogger(__name__)
 
@@ -33,12 +33,14 @@ class AIAdvisor:
     TEMPERATURE: float = 0.3
     
     def __init__(self, tinkoff_token: str) -> None:
-        self.stock_provider: TinkoffStockProvider = TinkoffStockProvider(tinkoff_token)
-        self.news_parser: NewsParser = NewsParser()
-        self.db: NewsDatabase = NewsDatabase()
+        self.vision_model = "moondream:latest"  # "llava:13b" или "bakllava:7b"
+        self.vision_enabled = False
+
+        self.stock_provider = services.stock_provider()
+        self.news_parser = services.news_parser()
+        self.db = services.db()
         
         self.llm_model: str = "gemma3:12b"
-        self.vision_enabled: bool = True
         self.max_news: int = self.MAX_NEWS_ANALYZE
         self.cache_enabled: bool = True
         self.cache_dir: str = "cache/ai_advisor"
@@ -111,6 +113,10 @@ class AIAdvisor:
         Отправляет запрос к Ollama и ожидает JSON-ответ.
         Возвращает распарсенный JSON или None при ошибке.
         """
+        # if DISABLE_AI:
+        #     logger.info("AI disabled, returning None")
+        #     return None
+
         url = f"{OLLAMA_HOST}/api/chat"
         payload = {
             "model": self.llm_model,
@@ -236,27 +242,32 @@ class AIAdvisor:
         return {'sentiment': 'neutral', 'score': 0, 'key_points': [], 'impact': 'low'}
 
     def analyze_image(self, image_path: str, news_text: str) -> Optional[str]:
+        """Анализирует изображение с использованием мультимодальной модели."""
+        if not self.vision_enabled:
+            return None
+
         try:
             with open(image_path, 'rb') as f:
                 image_base64 = base64.b64encode(f.read()).decode()
 
             prompt = f"""
-            Ты финансовый аналитик. Проанализируй это изображение (график, диаграмму или фото) 
-            в контексте этой новости:
-            
-            НОВОСТЬ: {news_text}
-            
-            Опиши КРАТКО:
-            1. Что показывает изображение?
-            2. Как это связано с новостью?
-            3. Какой вывод для инвестора?
-            
-            Ответь максимум 3 предложения.
-            """
+    Ты финансовый аналитик. Проанализируй это изображение в контексте поста:
+
+    ЗАГОЛОВОК ПОСТА: {news_text.split(chr(10))[0] if chr(10) in news_text else news_text}
+    ТЕКСТ ПОСТА: {news_text}
+
+    Если изображение НЕ ОТНОСИТСЯ к теме поста или не несёт полезной информации для инвестора (например, это логотип, иконка, реклама или случайная картинка), просто напиши: "Изображение не связано с содержанием поста".
+
+    Если изображение относится к посту, опиши кратко:
+    1. Что изображено (график, диаграмма, фото) — какие детали важны для инвестора?
+    2. Какой вывод для инвестора можно сделать на основе этого изображения?
+
+    Ответь максимум 4 предложениями.
+    """
 
             url = f"{OLLAMA_HOST}/api/chat"
             payload = {
-                "model": self.llm_model,
+                "model": self.vision_model,
                 "messages": [{
                     "role": "user",
                     "content": prompt,
@@ -265,15 +276,19 @@ class AIAdvisor:
                 "options": {"temperature": self.TEMPERATURE},
                 "stream": False
             }
-            response = httpx.post(url, json=payload, timeout=30)
+
+            response = httpx.post(url, json=payload, timeout=60)  # Увеличим timeout для картинок
             if response.status_code == 200:
                 data = response.json()
-                return data['message']['content']
+                content = data['message']['content']
+                return content.strip()  # возвращаем текст
             else:
-                logger.error(f"Ошибка при анализе картинки: {response.status_code}")
+                logger.error(f"Ошибка при анализе картинки: {response.status_code} - {response.text}")
+                return None
+
         except Exception as e:
             logger.error(f"Ошибка анализа картинки: {e}")
-        return None
+            return None
 
     def _combine_analysis(self, text_analysis: Dict[str, Any], image_analysis: Optional[str]) -> Dict[str, Any]:
         """
@@ -320,92 +335,94 @@ class AIAdvisor:
         return {}
 
     def analyze_all(self) -> Dict[str, Any]:
-        """
-        Полный анализ рынка: собирает новости, цены, анализирует текст и картинки.
-        """
         start_time = time.time()
         logger.info(f"🔍 Запускаю анализ с {self.llm_model}...")
 
-        # 1. Собираем новости (как обычно)
+        # 1. Собираем новости и цены
         news = self.news_parser.fetch_all_news(limit_per_source=2, max_total=self.max_news)
         logger.info(f"📰 Собрано {len(news)} новостей за {time.time()-start_time:.1f} сек")
 
-        # 2. Получаем цены
         prices = self._get_current_prices()
         logger.info(f"💰 Получены цены для {len(prices)} компаний")
 
-        # 3. Быстрый текстовый анализ (даёт общий сентимент, топ‑пик и т.д.)
-        quick = self._quick_analysis(news, prices)
-
-        # 4. Детальный анализ новостей, у которых есть картинки (топ‑5 по важности)
-        detailed_news = []
-        # Сортируем новости по важности (importance)
-        sorted_news = sorted(news, key=lambda x: x.importance, reverse=True)
-        for n in sorted_news[:5]:
-            if n.image_path and os.path.exists(n.image_path):
-                # Анализ текста новости
-                text_analysis = self._analyze_text(n.title + " " + n.summary)
-                # Анализ картинки
-                image_analysis = self.analyze_image(n.image_path, n.title)
-                # Объединяем
-                combined = self._combine_analysis(text_analysis, image_analysis)
-                detailed_news.append({
-                    'title': n.title,
-                    'source': n.source,
-                    'text_sentiment': text_analysis.get('sentiment'),
-                    'text_score': text_analysis.get('score'),
-                    'image_insight': image_analysis,
-                    'combined_score': combined.get('combined_score'),
-                    'key_points': combined.get('key_points', [])
-                })
-
-        # 5. Формируем результат
-        result = {
-            'timestamp': datetime.now(),
-            'news_count': len(news),
-            'companies_analyzed': len(prices),
-            'market_sentiment': quick.get('market_sentiment', 'neutral'),
-            'top_pick': quick.get('top_pick', 'SBER'),
-            'action': quick.get('action', 'HOLD'),
-            'reason': quick.get('reason', 'Анализ завершён'),
-            'confidence': quick.get('confidence', 0.5),
-            'prices': prices,
-            'detailed_news': detailed_news,          # новости с картинками
-        }
-
-        # 6. Кэширование (опционально)
+        # 2. Проверяем свежий кэш
         if self.cache_enabled:
-            self._save_cache(news, result)
+            cached = self._check_cache(news)
+            if cached:
+                logger.info(f"✅ Использован свежий кэш (время: {time.time()-start_time:.1f} сек)")
+                return cached
+
+        # 3. Пытаемся выполнить анализ через модель
+        analysis = None
+        try:
+            analysis = self._quick_analysis(news, prices)
+        except Exception as e:
+            logger.error(f"❌ Ошибка при вызове модели: {e}")
+            analysis = None
+
+        # 4. Если анализ не удался, пробуем использовать последний сохранённый
+        if analysis is None:
+            if self.advice_history:
+                last = self.advice_history[-1]
+                logger.info("⚠️ Модель недоступна, использую последний успешный анализ из истории")
+                last['analysis_time'] = time.time() - start_time
+                return last
+            else:
+                logger.warning("⚠️ Нет истории, возвращаю fallback")
+                return self._get_fallback_analysis(news, prices)
+
+        # 5. Если анализ успешен, сохраняем в кэш и историю
+        if self.cache_enabled:
+            self._save_cache(news, analysis)
 
         total_time = time.time() - start_time
         logger.info(f"✅ Анализ завершён за {total_time:.1f} сек")
-        result['analysis_time'] = total_time
-        return result
+        analysis['analysis_time'] = total_time
+        self.advice_history.append(analysis)
+        return analysis
 
     def _quick_analysis(self, news: List[NewsItem], prices: Dict[str, float]) -> Dict[str, Any]:
+        # Формируем сводку по новостям (как было, ограничиваем MAX_NEWS_QUICK)
         news_summary = "\n".join([f"- [{n.source}] {n.title[:100]}" for n in news[:self.MAX_NEWS_QUICK]])
+
+        # --- ИЗМЕНЕНИЕ: теперь берем ВСЕ тикеры, для которых есть цена ---
+        tickers_with_price = [ticker for ticker in self.company_info if ticker in prices]
         companies_summary = "\n".join([
-            f"- {info['name']} ({ticker}): {prices.get(ticker, 0):.0f}₽, див.{info['div_yield']}%"
-            for ticker, info in list(self.company_info.items())[:self.MAX_NEWS_QUICK]
-            if ticker in prices
+            f"- {self.company_info[ticker]['name']} ({ticker}): {prices[ticker]:.0f}₽, див.{self.company_info[ticker]['div_yield']}%"
+            for ticker in tickers_with_price
         ])
 
-        prompt = f"""Ты инвест-советник. Быстро проанализируй:
+        # Получаем историю анализов для компаний (топ-5 по ценам, как было)
+        history_context = ""
+        tickers_list = list(prices.keys())[:5]
+        for ticker in tickers_list:
+            past = self.db.get_recent_analysis_by_ticker(ticker, days=7, limit=3)
+            if past:
+                history_context += f"\nПоследние события по {ticker}:\n"
+                for p in past:
+                    history_context += f"- {p.get('summary', '')} (сентимент {p.get('sentiment')})\n"
 
-    НОВОСТИ:
-    {news_summary}
+        prompt = f"""Ты агрессивный инвест-советник, склонный к покупкам при малейших позитивных сигналах. 
+        Если новости нейтральные, но компания фундаментально сильна, рекомендуй BUY.
 
-    КОМПАНИИ:
-    {companies_summary}
+        НОВОСТИ:
+        {news_summary}
 
-    Ответь ТОЛЬКО JSON:
-    {{
-        "sentiment": "positive/neutral/negative",
-        "top_pick": "SBER",
-        "action": "BUY/HOLD/SELL",
-        "reason": "кратко (10 слов)",
-        "confidence": 0.8
-    }}"""
+        КОМПАНИИ (все доступные):
+        {companies_summary}
+
+        Ответь ТОЛЬКО JSON:
+        {{
+            "sentiment": "positive/neutral/negative",
+            "top_pick": "SBER",
+            "action": "BUY/HOLD/SELL",
+            "reason": "кратко (10 слов)",
+            "confidence": 0.8
+        }}
+
+        На основе истории новостей: 
+        {history_context}
+        """
 
         messages = [{'role': 'user', 'content': prompt}]
         options = {'temperature': self.TEMPERATURE, 'num_predict': 200}
@@ -418,7 +435,7 @@ class AIAdvisor:
         return {
             'timestamp': datetime.now(),
             'news_count': len(news),
-            'companies_analyzed': len(prices),
+            'companies_analyzed': len(prices),  # теперь это количество компаний с ценами
             'market_sentiment': result.get('sentiment', 'neutral'),
             'top_pick': result.get('top_pick', 'SBER'),
             'action': result.get('action', 'HOLD'),

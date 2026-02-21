@@ -338,6 +338,50 @@ class StockPriceProvider:
         
         return "\n".join(lines)
 
+    def get_history(self, ticker: str, days: int = 30) -> List[Dict]:
+        import requests
+        from datetime import datetime, timedelta
+
+        url = f"https://iss.moex.com/iss/history/engines/stock/markets/shares/securities/{ticker}.json"
+        end_date = datetime.now().strftime('%Y-%m-%d')
+        start_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+        params = {
+            'from': start_date,
+            'till': end_date,
+            'iss.meta': 'off',
+            'iss.only': 'history',
+            'limit': days + 10
+        }
+        logger.info(f"MOEX запрос для {ticker} с {start_date} по {end_date}")
+        try:
+            response = requests.get(url, params=params, headers=self.base_headers, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                history_data = data.get('history', {}).get('data', [])
+                columns = data.get('history', {}).get('columns', [])
+                if not history_data:
+                    logger.debug(f"MOEX: нет данных для {ticker} за период {start_date} - {end_date}")
+                    return []
+                result = []
+                for row in history_data:
+                    row_dict = dict(zip(columns, row))
+                    # поля: TRADEDATE, OPEN, LOW, HIGH, CLOSE, VOLUME
+                    result.append({
+                        'time': datetime.strptime(row_dict['TRADEDATE'], '%Y-%m-%d'),
+                        'open': row_dict.get('OPEN'),
+                        'high': row_dict.get('HIGH'),
+                        'low': row_dict.get('LOW'),
+                        'close': row_dict.get('CLOSE'),
+                        'volume': row_dict.get('VOLUME')
+                    })
+                result.sort(key=lambda x: x['time'])
+                logger.info(f"MOEX: получено {len(result)} свечей для {ticker}")
+                return result
+            else:
+                logger.error(f"MOEX: HTTP {response.status_code} для {ticker}")
+        except Exception as e:
+            logger.error(f"Ошибка получения истории с MOEX для {ticker}: {e}")
+        return []
 
 # Словарь популярных тикеров
 POPULAR_TICKERS = {

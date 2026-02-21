@@ -51,6 +51,7 @@ class TinkoffStockProvider:
             'IRAO': 'BBG0047315D0',      # Интер РАО
             'HYDR': 'BBG00475J816',      # РусГидро
             'NVTK': 'BBG0047315G5',      # Новатэк
+            'LNZLP': 'BBG000SR0YS4',     # Лензолото - привилегированные акции
         }
 
         # Кэш для цен
@@ -213,10 +214,19 @@ class TinkoffStockProvider:
         except:
             days = 30
 
+        # Сначала пробуем взять FIGI из приоритетного списка
         figi = self.priority_figi.get(ticker)
         if not figi:
-            logger.warning(f"Нет FIGI для {ticker}")
-            return []
+            # Если нет в приоритетных, ищем через менеджер FIGI
+            logger.debug(f"🔍 {ticker}: ищем FIGI для истории через API")
+            figi_info = self.figi_manager.find_figi(ticker)
+            if figi_info and figi_info.get('figi'):
+                figi = figi_info['figi']
+                # Можно добавить в priority_figi для будущих запросов
+                self.priority_figi[ticker] = figi
+            else:
+                logger.warning(f"⚠️ Нет FIGI для {ticker}, история не может быть получена")
+                return []
 
         url = f"{self.base_url}/tinkoff.public.invest.api.contract.v1.MarketDataService/GetCandles"
         from_date = (datetime.now() - timedelta(days=days)).isoformat() + "Z"
@@ -236,7 +246,6 @@ class TinkoffStockProvider:
                 candles = data.get('candles', [])
                 history = []
                 for c in candles:
-                    # Проверяем наличие необходимых ключей
                     if not all(k in c for k in ('time', 'open', 'high', 'low', 'close', 'volume')):
                         logger.warning(f"Пропуск свечи: отсутствуют ключи {c.keys()}")
                         continue

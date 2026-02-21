@@ -8,13 +8,127 @@ from telegram.ext import ContextTypes
 import logging
 from datetime import datetime, time, timedelta
 import pandas as pd
+import numpy as np
 from backtester import Backtester
 import services
-import pandas as pd
-# import ollama
+import ollama
+import json
+import sqlite3
+import httpx
+from config import OLLAMA_HOST
+
 logger = logging.getLogger(__name__)
 
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _log_user_activity(update)
+    """Приветственное сообщение."""
+    if not update.effective_chat:
+        return
+    text = (
+        "📰 Бот для отслеживания финансовых новостей и цен акций\n\n"
+        "Я помогу тебе следить за новостями компаний и отслеживать цены акций.\n\n"
+        "ИИ-трейдер (автозапуск):\n"
+        "/traderstart - Запустить трейдера\n"
+        "/traderstatus - 📊 Состояние портфеля\n"
+        "/traderanalyze - 🔍 Принудительный анализ\n"
+        "/traderstop - ⏹️ Остановить трейдера\n"
+        "/profit - 📈 Фиксируем прибыль📈\n"
+        "/trades – 📋 история сделок\n\n"
+        "Новости:\n"
+        "/news - последние новости\n"
+        "/subscribe SBER - подписаться на новости\n"
+        "/search SBER - поиск новостей\n"
+        "/pulse – 📱 Посты из Tinkoff Пульс\n\n"
+        "Цены акций:\n"
+        "/price SBER - цена акции\n"
+        "/portfolio - цены по подпискам\n"
+        "/tickers - список доступных тикеров\n\n"
+        "Аналитика:\n"
+        "/advice - 🤖 ИИ-рекомендации\n"
+        "/backtest TICKER дней - 📊 бэктест стратегии\n"
+        "/chart TICKER [дней] [rsi] [macd] – 📈 график с анализом\n"
+        "/analyze_ticker TICKER – 🧠 глубокий анализ акции\n"
+        "/ratings – 📊 рейтинг компаний по новостям\n\n"
+        "Управление:\n"
+        "/mysubs - мои подписки\n"
+        "/status - статус бота\n"
+        "/help - подробная помощь"
+    )
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=text
+        # parse_mode='Markdown' убрали!
+    )
+
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
+
+def format_datetime(dt):
+    """Преобразует datetime или ISO-строку в формат ДД.ММ.ГГГГ ЧЧ:ММ."""
+    if dt is None:
+        return "Неизвестно"
+    try:
+        if isinstance(dt, datetime):
+            return dt.strftime('%d.%m.%Y %H:%M')
+        elif isinstance(dt, str):
+            # Убираем возможную 'Z' в конце ISO-строки
+            dt_clean = dt.replace('Z', '+00:00') if 'Z' in dt else dt
+            parsed = datetime.fromisoformat(dt_clean)
+            return parsed.strftime('%d.%m.%Y %H:%M')
+    except (ValueError, TypeError) as e:
+        logger.error(f"Ошибка форматирования даты {dt}: {e}")
+        return str(dt)  # fallback
+    return str(dt)
+
+async def trades_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает историю последних сделок."""
+    await _log_user_activity(update)
+    if not update.effective_chat:
+        return
+
+    db = services.db()
+    if db is None:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="❌ Ошибка базы данных")
+        return
+
+    with sqlite3.connect(db.db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT timestamp, ticker, action, shares, price, profit, reason
+            FROM trades
+            ORDER BY timestamp DESC
+            LIMIT 10
+        ''')
+        rows = cursor.fetchall()
+
+    if not rows:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="📭 История сделок пуста")
+        return
+
+    lines = ["📋 *Последние сделки:*\n"]
+    for ts, ticker, action, shares, price, profit, reason in rows:
+        # Преобразуем ISO-строку в datetime и форматируем
+        try:
+            # Если ts уже объект datetime, используем его напрямую
+            if isinstance(ts, datetime):
+                dt = ts
+            else:
+                # Иначе парсим строку (убираем возможную 'Z' в конце)
+                ts_clean = ts.replace('Z', '+00:00') if 'Z' in ts else ts
+                dt = datetime.fromisoformat(ts_clean)
+            date_str = dt.strftime('%d.%m.%Y %H:%M')
+        except (ValueError, TypeError) as e:
+            logger.error(f"Ошибка парсинга даты {ts}: {e}")
+            date_str = ts  # fallback – оставляем как есть
+
+        action_emoji = "🟢" if action == 'BUY' else "🔴"
+        reason_emoji = {
+            'take_profit': '🎯',
+            'stop_loss': '🛑',
+            'manual': '👤'
+        }.get(reason, '')
+        profit_str = f"{profit:+.2f}" if profit != 0 else ""
+        lines.append(f"{action_emoji} {date_str} {ticker} {action} {shares} @ {price:.2f} {profit_str} {reason_emoji}")
+    await context.bot.send_message(chat_id=update.effective_chat.id, text="\n".join(lines), parse_mode='Markdown')
 
 def escape_markdown(text: str) -> str:
     """Экранирует спецсимволы для Markdown."""
@@ -36,6 +150,41 @@ async def _log_user_activity(update: Update) -> None:
         logger.warning("Попытка логирования активности без effective_user")
 
 # ========== ОСНОВНЫЕ КОМАНДЫ ==========
+
+async def profit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _log_user_activity(update)
+    if not update.effective_chat:
+        return
+
+    db = services.db()
+    if db is None:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="❌ Ошибка базы данных")
+        return
+
+    with sqlite3.connect(db.db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT 
+                COUNT(*) as total_trades,
+                SUM(CASE WHEN profit > 0 THEN 1 ELSE 0 END) as wins,
+                SUM(profit) as total_profit
+            FROM trades
+        ''')
+        row = cursor.fetchone()
+        total, wins, profit = row
+
+    if total == 0:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="📭 Ещё нет завершённых сделок")
+        return
+
+    win_rate = (wins / total) * 100 if total > 0 else 0
+    text = (
+        f"📊 *Статистика сделок*\n"
+        f"Всего сделок: {total}\n"
+        f"Прибыльных: {wins} ({win_rate:.1f}%)\n"
+        f"Общая прибыль: {profit:+.2f} ₽"
+    )
+    await context.bot.send_message(chat_id=update.effective_chat.id, text=text, parse_mode='Markdown')
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _log_user_activity(update)
@@ -63,45 +212,6 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📆 Активных за неделю: {stats['week_active']}"
     )
     await context.bot.send_message(chat_id=update.effective_chat.id, text=text, parse_mode='Markdown')
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _log_user_activity(update)
-    """Приветственное сообщение."""
-    if not update.effective_chat:
-        return
-    text = (
-        "📰 Бот для отслеживания финансовых новостей и цен акций\n\n"
-        "Я помогу тебе следить за новостями компаний и отслеживать цены акций.\n\n"
-        "ИИ-трейдер (автозапуск):\n"
-        "/traderstart - Запустить трейдера\n"
-        "/traderstatus - 📊 Состояние портфеля\n"
-        "/traderanalyze - 🔍 Принудительный анализ\n"
-        "/traderstop - ⏹️ Остановить (если нужно)\n\n"
-        "Новости:\n"
-        "/news - последние новости\n"
-        "/subscribe SBER - подписаться на новости\n"
-        "/search SBER - поиск новостей\n"
-        "/pulse – 📱 Посты из Tinkoff Пульс\n\n"
-        "Цены акций:\n"
-        "/price SBER - цена акции\n"
-        "/portfolio - цены по подпискам\n"
-        "/tickers - список доступных тикеров\n\n"
-        "Аналитика:\n"
-        "/advice - 🤖 ИИ-рекомендации\n"
-        "/backtest TICKER дней - 📊 бэктест стратегии\n"
-        "/chart TICKER [дней] [rsi] [macd] – 📈 график с анализом\n"
-        "/analyze_ticker TICKER – 🧠 глубокий анализ акции\n"
-        "/ratings – 📊 рейтинг компаний по новостям\n\n"
-        "Управление:\n"
-        "/mysubs - мои подписки\n"
-        "/status - статус бота\n"
-        "/help - подробная помощь"
-    )
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text=text
-        # parse_mode='Markdown' убрали!
-    )
 
 async def chart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _log_user_activity(update)
@@ -246,65 +356,88 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
 
 async def ratings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает рейтинг компаний на основе сентимента последних новостей."""
     await _log_user_activity(update)
     if not update.effective_chat:
         return
-
-    np = services.news_parser()
     db = services.db()
-
-    # Проверяем, что сервисы инициализированы
-    if np is None:
-        await context.bot.send_message(chat_id=update.effective_chat.id, text="❌ Ошибка инициализации парсера")
-        return
     if db is None:
         await context.bot.send_message(chat_id=update.effective_chat.id, text="❌ Ошибка базы данных")
         return
 
-    recent_news = db.get_recent_news(limit=50)
-    if not recent_news:
-        await context.bot.send_message(chat_id=update.effective_chat.id, text="😕 Нет новостей для анализа")
-        return
+    # --- Рейтинг по новостям (как было) ---
+    with sqlite3.connect(db.db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT tickers, sentiment_score FROM news_analysis
+            WHERE published > datetime('now', '-7 days')
+        ''')
+        rows = cursor.fetchall()
 
-    # Простая функция сентимента (можно вынести отдельно)
-    def simple_sentiment(text: str) -> float:
-        text_lower = text.lower()
-        positive = ['растет', 'вырастет', 'прибыль', 'дивиденды', 'успех', 'дорожает', 'buy', 'long']
-        negative = ['падает', 'упадет', 'убыток', 'проблемы', 'кризис', 'дешевеет', 'sell', 'short']
-        pos_count = sum(1 for w in positive if w in text_lower)
-        neg_count = sum(1 for w in negative if w in text_lower)
-        if pos_count + neg_count == 0:
-            return 0
-        return (pos_count - neg_count) / (pos_count + neg_count)
-
-    sentiment_sum = {}
-    for item in recent_news:
-        tickers = item.get('related_tickers', [])
-        if not tickers:
-            continue
-        sentiment = simple_sentiment(item['title'])
+    ticker_scores = {}
+    ticker_counts = {}
+    for tickers_json, score in rows:
+        tickers = json.loads(tickers_json)
         for ticker in tickers:
-            if ticker not in sentiment_sum:
-                sentiment_sum[ticker] = [0.0, 0]
-            sentiment_sum[ticker][0] += sentiment
-            sentiment_sum[ticker][1] += 1
+            ticker_scores[ticker] = ticker_scores.get(ticker, 0.0) + score
+            ticker_counts[ticker] = ticker_counts.get(ticker, 0) + 1
 
-    ratings = [(ticker, total / count) for ticker, (total, count) in sentiment_sum.items()]
-    if not ratings:
-        await context.bot.send_message(chat_id=update.effective_chat.id, text="📭 Нет данных по тикерам")
+    news_ratings = []
+    for ticker, total_score in ticker_scores.items():
+        avg_score = total_score / ticker_counts[ticker]
+        news_ratings.append((ticker, avg_score))
+    news_ratings.sort(key=lambda x: x[1], reverse=True)
+
+    # --- Рейтинг по Пульсу (новый) ---
+    pulse_data = db.get_pulse_sentiment(days=7)
+    pulse_ticker_scores = {}
+    pulse_ticker_counts = {}
+    for row in pulse_data:
+        ticker = row['ticker']
+        pulse_ticker_scores[ticker] = pulse_ticker_scores.get(ticker, 0.0) + row['avg_sentiment'] * row['post_count']
+        pulse_ticker_counts[ticker] = pulse_ticker_counts.get(ticker, 0) + row['post_count']
+
+    pulse_ratings = []
+    for ticker, total_weighted in pulse_ticker_scores.items():
+        total_posts = pulse_ticker_counts[ticker]
+        if total_posts > 0:
+            avg = total_weighted / total_posts
+            pulse_ratings.append((ticker, avg))
+    pulse_ratings.sort(key=lambda x: x[1], reverse=True)
+
+    # --- Формируем сообщение ---
+    lines = ["📊 *Рейтинг компаний по сентименту (за 7 дней)*\n"]
+
+    if news_ratings:
+        lines.append("\n📰 *По новостям:*")
+        for i, (ticker, avg) in enumerate(news_ratings[:5], 1):
+            emoji = "🟢" if avg > 0.2 else "🔴" if avg < -0.2 else "🟡"
+            lines.append(f"{i}. {emoji} *{ticker}*: {avg:.2f}")
+
+    if pulse_ratings:
+        lines.append("\n👥 *По Tinkoff Пульс:*")
+        for i, (ticker, avg) in enumerate(pulse_ratings[:5], 1):
+            emoji = "🟢" if avg > 0.2 else "🔴" if avg < -0.2 else "🟡"
+            lines.append(f"{i}. {emoji} *{ticker}*: {avg:.2f}")
+
+    if not news_ratings and not pulse_ratings:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="📭 Нет данных для рейтинга")
         return
 
-    ratings.sort(key=lambda x: x[1], reverse=True)
-
-    lines = ["📊 *Рейтинг компаний по новостному сентименту*\n"]
-    for i, (ticker, avg) in enumerate(ratings[:10], 1):
-        emoji = "🟢" if avg > 0.2 else "🔴" if avg < -0.2 else "🟡"
-        lines.append(f"{i}. {emoji} *{ticker}*: {avg:.2f}")
-    await context.bot.send_message(chat_id=update.effective_chat.id, text="\n".join(lines), parse_mode='Markdown')
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="\n".join(lines),
+        parse_mode='Markdown'
+    )
 
 async def analyze_ticker_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Глубокий ИИ-анализ конкретного тикера."""
+    # if os.getenv("DISABLE_AI", "false").lower() == "true":
+    #     await context.bot.send_message(
+    #         chat_id=update.effective_chat.id,
+    #         text="🤖 ИИ временно отключён. Анализ недоступен."
+    #     )
+    #     return
+    
     # Проверяем наличие пользователя перед логированием
     if not update.effective_user:
         await context.bot.send_message(chat_id=update.effective_chat.id, text="❌ Не удалось определить пользователя") # type: ignore
@@ -318,14 +451,14 @@ async def analyze_ticker_command(update: Update, context: ContextTypes.DEFAULT_T
     
     ticker = context.args[0].upper()
     sp = services.stock_provider()
-    np = services.news_parser()
+    news_parser = services.news_parser()
     advisor = services.ai_advisor()
 
     # Проверки на None
     if sp is None:
         await context.bot.send_message(chat_id=update.effective_chat.id, text="❌ Ошибка инициализации модуля цен")
         return
-    if np is None:
+    if news_parser is None:
         await context.bot.send_message(chat_id=update.effective_chat.id, text="❌ Ошибка инициализации парсера")
         return
     if advisor is None:
@@ -346,7 +479,7 @@ async def analyze_ticker_command(update: Update, context: ContextTypes.DEFAULT_T
     div_yield = advisor.company_info.get(ticker, {}).get('div_yield', 'N/A')
 
     # 3. Последние новости
-    news = np.get_news_by_ticker(ticker, hours=168)  # за неделю
+    news = news_parser.get_news_by_ticker(ticker, hours=168)  # за неделю
     news_titles = [f"- {n.title}" for n in news[:5]] if news else ["Новостей нет"]
 
     # 4. Технические данные (история цен за 30 дней)
@@ -356,8 +489,8 @@ async def analyze_ticker_command(update: Update, context: ContextTypes.DEFAULT_T
         df = pd.DataFrame(history)
         closes = df['close'].values
         # Скользящие средние
-        ma5 = np.mean(closes[-5:])
-        ma20 = np.mean(closes)
+        ma5 = df['close'].tail(5).mean()
+        ma20 = df['close'].mean()
         trend = "восходящий" if ma5 > ma20 else "нисходящий" if ma5 < ma20 else "боковой"
         # RSI
         delta = df['close'].diff()
@@ -390,33 +523,21 @@ async def analyze_ticker_command(update: Update, context: ContextTypes.DEFAULT_T
     """
 
     # 6. Отправляем запрос к модели
-    try:
-        # Используем метод `_call_ollama`, который уже должен быть в `advisor`
-        result = advisor._call_ollama(prompt, temperature=0.3)
-        if result:
-            # _call_ollama возвращает словарь (распарсенный JSON) или None
-            # Здесь нужно сформировать ответ. Можно просто взять поле 'content' из результата?
-            # Но в _call_ollama мы возвращаем распарсенный JSON. Лучше переделать _call_ollama так,
-            # чтобы он возвращал полный текст ответа, если не ожидается JSON.
-            # Для простоты я предлагаю использовать другой подход: отправить запрос через httpx прямо здесь.
-            import httpx
-            from config import OLLAMA_HOST
-            url = f"{OLLAMA_HOST}/api/chat"
-            payload = {
-                "model": advisor.llm_model,
-                "messages": [{"role": "user", "content": prompt}],
-                "options": {"temperature": 0.3},
-                "stream": False
-            }
-            response = httpx.post(url, json=payload, timeout=30)
-            if response.status_code == 200:
-                data = response.json()
-                answer = data['message']['content']
-                await msg.edit_text(f"🧠 *Анализ {ticker}*\n\n{answer}", parse_mode='Markdown')
-            else:
-                await msg.edit_text(f"❌ Ошибка при анализе {ticker} (HTTP {response.status_code})")
+    try:        
+        url = f"{OLLAMA_HOST}/api/chat"
+        payload = {
+            "model": advisor.llm_model,  # используем gemma3:12b
+            "messages": [{"role": "user", "content": prompt}],
+            "options": {"temperature": 0.3},
+            "stream": False
+        }
+        response = httpx.post(url, json=payload, timeout=30)
+        if response.status_code == 200:
+            data = response.json()
+            answer = data['message']['content']
+            await msg.edit_text(f"🧠 *Анализ {ticker}*\n\n{answer}", parse_mode='Markdown')
         else:
-            await msg.edit_text(f"❌ Не удалось получить ответ от модели")
+            await msg.edit_text(f"❌ Ошибка при анализе {ticker} (HTTP {response.status_code})")
     except Exception as e:
         logger.error(f"Ошибка при анализе {ticker}: {e}")
         await msg.edit_text(f"❌ Ошибка при анализе {ticker}")
@@ -533,7 +654,7 @@ async def news_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             safe_title = escape_markdown(item.title)
             tickers = f" `{', '.join(item.related_tickers)}`" if item.related_tickers else ''
             lines.append(f"\n{source_emoji} *{safe_title}*{tickers}")
-            lines.append(f"   🕒 {item.published.strftime('%H:%M')} | 📍 {item.source}")
+            lines.append(f"   🕒 {format_datetime(item.published)} | 📍 {item.source}")
             lines.append(f"   🔗 {item.link}")
 
         lines.append("\n" + "═" * 40)
@@ -593,6 +714,13 @@ async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def advice_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """ИИ-рекомендации."""
+    # if os.getenv("DISABLE_AI", "false").lower() == "true":
+    #     await context.bot.send_message(
+    #         chat_id=update.effective_chat.id,
+    #         text="🤖 ИИ временно отключён. Попробуйте позже."
+    #     )
+    #     return
+    
     if not update.effective_chat:
         return
 
@@ -729,7 +857,7 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     for t in trades[-3:]:
         emoji = "🟢" if t['action'] == 'BUY' else "🔴"
-        date_str = t['date'].strftime('%d.%m') if hasattr(t['date'], 'strftime') else str(t['date'])[5:10]
+        date_str = format_datetime(t['date'])
         report += f"{emoji} {date_str} {t['action']} {t['shares']} @ {t['price']:.2f}\n"
 
     await msg.edit_text(report, parse_mode='Markdown')
@@ -846,7 +974,7 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines = [f"📰 *Новости по {ticker}*\n"]
         for item in news[:5]:
             lines.append(f"\n• *{escape_markdown(item.title)}*")
-            lines.append(f"  🕒 {item.published.strftime('%H:%M %d.%m')} | 📍 {item.source}")
+            lines.append(f"  🕒 {format_datetime(item.published)} | 📍 {item.source}")
             lines.append(f"  🔗 {item.link}")
         lines.append(f"\n📊 Всего найдено: {len(news)}")
         await msg.edit_text("\n".join(lines), parse_mode='Markdown', disable_web_page_preview=True)
@@ -1043,7 +1171,7 @@ async def trader_status_command(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 async def pulse_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает последние посты из Tinkoff Пульс."""
+    """Показывает последние посты из Tinkoff Пульс с анализом."""
     await _log_user_activity(update)
     if not update.effective_chat:
         return
@@ -1053,21 +1181,35 @@ async def pulse_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=update.effective_chat.id, text="❌ Ошибка инициализации Пульс")
         return
 
-    # Получаем ленту
-    posts = parser.get_feed(limit=5)
+    msg = await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="🔍 *Загружаю посты из Tinkoff Пульс...*",
+        parse_mode='Markdown'
+    )
+
+    posts = parser.collect_all(limit_per_feed=10, max_total=20)  # получим до 20 свежих постов
     if not posts:
-        await context.bot.send_message(chat_id=update.effective_chat.id, text="😕 Не удалось получить посты")
+        await msg.edit_text("😕 Не удалось получить посты или их нет.")
         return
 
-    lines = ["📱 *Tinkoff Пульс*\n"]
-    for post in posts:
+    lines = ["📱 *Tinkoff Пульс — свежие посты*\n"]
+    for post in posts[:7]:  # показываем до 7 постов
+        # Эмодзи сентимента
         emoji = "🟢" if post.sentiment_category == 'positive' else "🔴" if post.sentiment_category == 'negative' else "🟡"
-        tickers = f" [{', '.join(post.tickers)}]" if post.tickers else ""
-        lines.append(f"{emoji} *{post.author}*{tickers}")
-        lines.append(f"   {post.text[:100]}...")
-        lines.append(f"   👍 {post.likes}  💬 {post.comments}  🕒 {post.date.strftime('%H:%M %d.%m')}\n")
+        # Тикеры
+        tickers_str = f" [{', '.join(post.tickers)}]" if post.tickers else ""
+        # Текст (обрезаем)
+        text_short = post.text[:100] + "..." if len(post.text) > 100 else post.text
+        # Дата
+        date_str = post.date.strftime('%d.%m %H:%M')
+        # Ссылка (если есть)
+        link = f"🔗 [Ссылка](https://www.tinkoff.ru/invest/social/post/{post.id})" if post.id else ""
 
-    await context.bot.send_message(chat_id=update.effective_chat.id, text="\n".join(lines), parse_mode='Markdown')
+        lines.append(f"{emoji} *{post.author}*{tickers_str}  {date_str}")
+        lines.append(f"   {text_short}")
+        lines.append(f"   👍 {post.likes}  💬 {post.comments}  {link}\n")
+
+    await msg.edit_text("\n".join(lines), parse_mode='Markdown', disable_web_page_preview=True)
 
 async def trader_analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_chat:
@@ -1103,3 +1245,13 @@ async def trader_analyze_command(update: Update, context: ContextTypes.DEFAULT_T
     trader.analyze_and_trade()
     portfolio = trader.format_portfolio_message()
     await msg.edit_text(f"✅ *Анализ завершён*\n\n{portfolio}", parse_mode='Markdown')
+
+def clean_old_pulse_sentiment(self, days: int = 30):
+    """Удаляет записи старше указанного количества дней."""
+    with sqlite3.connect(self.db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            DELETE FROM pulse_sentiment WHERE date < date('now', ?)
+        ''', (f'-{days} days',))
+        conn.commit()
+        logger.info(f"Удалено {cursor.rowcount} старых записей из pulse_sentiment")

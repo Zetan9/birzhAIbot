@@ -5,33 +5,30 @@
 import logging
 from config import TINKOFF_TOKEN
 
-# Словарь для хранения всех глобальных объектов
 _services = {}
 
 logger = logging.getLogger(__name__)
 
 def get_service(name: str, creator_func=None):
     """
-    Возвращает сервис по имени. Если сервис ещё не создан, вызывает creator_func.
+    Возвращает сервис по имени. Если сервис не существует, создаёт его через creator_func.
+    Если creator_func не указан и сервис отсутствует — выбрасывает исключение.
     """
     if name not in _services:
-        if creator_func:
-            _services[name] = creator_func()
-            logger.info(f"✅ Сервис '{name}' создан.")
-        else:
-            return None
+        if creator_func is None:
+            raise RuntimeError(f"Сервис '{name}' не найден и не может быть создан")
+        _services[name] = creator_func()
+        logger.info(f"✅ Сервис '{name}' создан.")
     return _services[name]
 
 def set_service(name: str, instance):
-    """Принудительно устанавливает сервис (полезно для тестов или явной инициализации)."""
     _services[name] = instance
     logger.info(f"✅ Сервис '{name}' установлен вручную.")
 
 def get_all_services():
-    """Возвращает словарь всех созданных сервисов (для отладки)."""
     return _services
 
-# Функции-создатели для каждого сервиса
+# Функции-создатели
 def create_news_parser():
     from news_parser import NewsParser
     return NewsParser()
@@ -52,7 +49,15 @@ def create_ai_trader():
     from ai_trader import VirtualTrader
     return VirtualTrader(initial_balance=1_000_000)
 
-# Удобные обёртки для получения сервисов (ВОЗВРАЩАЮТ ЭКЗЕМПЛЯРЫ)
+def create_pulse_parser():
+    from tinkoff_pulse import TinkoffPulseParser
+    from config import TINKOFF_TOKEN
+    return TinkoffPulseParser(token=TINKOFF_TOKEN)  # токен необязателен
+
+def pulse_parser():
+    return get_service('pulse_parser', create_pulse_parser)
+
+# Удобные обёртки (теперь они всегда возвращают объект, никогда None)
 def news_parser():
     return get_service('news_parser', create_news_parser)
 
@@ -67,11 +72,3 @@ def ai_advisor():
 
 def ai_trader():
     return get_service('ai_trader', create_ai_trader)
-
-def create_pulse_parser():
-    from tinkoff_pulse import TinkoffPulseParser
-    from config import TINKOFF_TOKEN
-    return TinkoffPulseParser(token=TINKOFF_TOKEN)
-
-def pulse_parser():
-    return get_service('pulse_parser', create_pulse_parser)

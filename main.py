@@ -11,6 +11,7 @@ from config import TELEGRAM_BOT_TOKEN, TINKOFF_TOKEN
 from ai_trader import start_auto_trading
 from ai_monitor import start_monitoring
 from pulse_monitor import PulseMonitor
+from config import TG_API_ID, TG_API_HASH
 from bot import (  # все команды
     start, help_command, news_command, price_command,
     advice_command, status_command, subscribe_command,
@@ -20,7 +21,8 @@ from bot import (  # все команды
     trader_status_command, trader_analyze_command,
     backtest_command, monitor_command, stats_command,
     chart_command, pulse_command, analyze_chart_command,
-    ratings_command, analyze_ticker_command
+    ratings_command, analyze_ticker_command, profit_command,
+    trades_command
 )
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -85,12 +87,13 @@ async def run_bot():
     app.add_handler(CommandHandler("analyze_chart", analyze_chart_command))
     app.add_handler(CommandHandler("ratings", ratings_command))
     app.add_handler(CommandHandler("analyze_ticker", analyze_ticker_command))
-    # Альтернативные имена команд
     app.add_handler(CommandHandler("traderstart", trader_start_command))
     app.add_handler(CommandHandler("traderstop", trader_stop_command))
     app.add_handler(CommandHandler("traderstatus", trader_status_command))
     app.add_handler(CommandHandler("traderanalyze", trader_analyze_command))
-    
+    app.add_handler(CommandHandler("profit", profit_command))
+    app.add_handler(CommandHandler("trades", trades_command))
+
     # Запуск бота
     await app.initialize()
     await app.start()
@@ -121,10 +124,10 @@ async def run_bot():
     else:
         logger.error("❌ Не удалось создать трейдера")
 
-    # Запуск мониторинга новостей
-    if NOTIFICATION_CHAT_ID:
-        asyncio.create_task(start_monitoring(app.bot, NOTIFICATION_CHAT_ID))
-        logger.info(f"🚀 Мониторинг новостей запущен для чата {NOTIFICATION_CHAT_ID}")
+    # # Запуск мониторинга новостей
+    # if NOTIFICATION_CHAT_ID:
+    #     asyncio.create_task(start_monitoring(app.bot, NOTIFICATION_CHAT_ID))
+    #     logger.info(f"🚀 Мониторинг новостей запущен для чата {NOTIFICATION_CHAT_ID}")
 
     # # Запуск мониторинга Пульса
     # if NOTIFICATION_CHAT_ID:
@@ -132,12 +135,19 @@ async def run_bot():
     #     asyncio.create_task(pulse_monitor.start_monitoring())
     #     logger.info("📱 Мониторинг Tinkoff Пульс запущен")
 
-    # Запуск мониторинга Smart-Lab
+    # После создания trader
     if NOTIFICATION_CHAT_ID:
-        from smartlab_monitor import SmartLabMonitor
-        smartlab_monitor = SmartLabMonitor(app.bot, NOTIFICATION_CHAT_ID)
-        asyncio.create_task(smartlab_monitor.start_monitoring())
-        logger.info("📊 Мониторинг Smart-Lab запущен")
+        from moex_signals_monitor import MoexSignalsMonitor
+        moex_monitor = MoexSignalsMonitor(app.bot, NOTIFICATION_CHAT_ID, trader=trader)
+        asyncio.create_task(moex_monitor.start())
+        logger.info("📡 Мониторинг MOEX Signals через RSS запущен")
+
+    # # Запуск мониторинга Smart-Lab
+    # if NOTIFICATION_CHAT_ID:
+    #     from smartlab_monitor import SmartLabMonitor
+    #     smartlab_monitor = SmartLabMonitor(app.bot, NOTIFICATION_CHAT_ID)
+    #     asyncio.create_task(smartlab_monitor.start_monitoring())
+    #     logger.info("📊 Мониторинг Smart-Lab запущен")
 
     # Основной цикл
     try:
@@ -149,6 +159,13 @@ async def run_bot():
             trader.stop_trading()
         await app.stop()
         await app.shutdown()
+
+    # Запуск непрерывного анализа новостей (если есть bot)
+    if app.bot and NOTIFICATION_CHAT_ID:
+        from continuous_news_analyzer import ContinuousNewsAnalyzer
+        news_analyzer = ContinuousNewsAnalyzer(app.bot, NOTIFICATION_CHAT_ID)
+        asyncio.create_task(news_analyzer.run())
+        logger.info("📰 Непрерывный анализ новостей запущен")
 
 if __name__ == "__main__":
     asyncio.run(run_bot())

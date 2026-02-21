@@ -357,8 +357,8 @@ class NewsParser:
                     # Извлечение картинки (если есть)
                     image_path = None
                     
-                    if link:
-                        image_path = self._extract_image_from_url(str(link), source_name)
+                    # if link:
+                    #     image_path = self._extract_image_from_url(str(link), source_name)
 
                     news_item = NewsItem(
                         source=source_name,

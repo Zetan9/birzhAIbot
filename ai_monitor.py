@@ -9,11 +9,9 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
 import json
 import os
-from ai_advisor import AIAdvisor
-from news_parser import NewsParser
-from database import NewsDatabase
 from config import TINKOFF_TOKEN
 import ollama
+import services
 
 logger = logging.getLogger(__name__)
 
@@ -23,9 +21,9 @@ class AIMarketMonitor:
     def __init__(self, bot, chat_id: Optional[int] = None):
         self.bot = bot
         self.chat_id: Optional[int] = chat_id
-        self.ai_advisor = AIAdvisor(TINKOFF_TOKEN)
-        self.news_parser = NewsParser()
-        self.db = NewsDatabase()
+        self.ai_advisor = services.ai_advisor()
+        self.news_parser = services.news_parser()
+        self.db = services.db()
         
         # Настройки мониторинга
         self.check_interval = 3600  # Проверка каждый час

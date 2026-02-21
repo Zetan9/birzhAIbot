@@ -9,10 +9,10 @@ from typing import Dict, List, Any, Optional
 import json
 import os
 import time
+import services
 from collections import defaultdict
-from ai_advisor import AIAdvisor
-from tinkoff_stocks import TinkoffStockProvider
 from config import TINKOFF_TOKEN
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -20,34 +20,139 @@ class VirtualTrader:
     """Автономный трейдер с виртуальным портфелем"""
     
     def __init__(self, initial_balance: float = 1000000):
-        self.ai_advisor = AIAdvisor(TINKOFF_TOKEN)
-        self.stock_provider = TinkoffStockProvider(TINKOFF_TOKEN)
-        
-        # Начальный баланс (1 млн рублей)
+        self.ai_advisor = services.ai_advisor()
+        self.stock_provider = services.stock_provider()
+
         self.initial_balance = initial_balance
         self.balance = initial_balance
-        self.portfolio = {}  # {ticker: {'shares': int, 'avg_price': float}}
-        
-        # История торговли
-        self.trades = []  # Все сделки
-        self.performance_history = []  # История доходности
-        self.ai_decisions = []  # Решения ИИ
-        
-        # Настройки торговли
-        self.max_position_size = 0.4  # Макс 25% портфеля на одну позицию
-        self.min_confidence = 0.5  # Минимальная уверенность для сделки
-        self.trade_fee = 0.003  # Комиссия 0.3%
-        
-        # Состояние
-        self.is_trading = False
+        self.portfolio = {}
+
+        self.trades = []
+        self.performance_history = []
+        self.ai_decisions = []
+
+        # ===== НОВЫЕ АГРЕССИВНЫЕ НАСТРОЙКИ =====
+        self.max_position_size = 0.45          # макс доля одной акции (было 0.35)
+        self.min_confidence = 0.5               # порог уверенности (было 0.7)
+        self.trade_fee = 0.003
+        # =========================================
+
+        # Параметры трейлинг-стопа
+        self.use_trailing_stop = True
+        self.trailing_stop_pct = 5.0  # откат от максимума в %
+
+        self.highest_price = {}  # для трейлинг-стопа
+
+        self.price_history_cache = {}  # ticker -> (timestamp, DataFrame)
+        self.history_cache_ttl = 3600  # 1 час
+
+        self.is_trading = True
         self.last_analysis = None
         self.daily_pnl = 0
-        
-        # Загружаем сохранённое состояние
+
+        # Параметры для технических продаж
+        self.sell_rsi_overbought = 80          # RSI выше этого - продаём часть
+        self.sell_rsi_fraction = 0.3            # какая часть позиции продаётся при RSI > 80
+        self.sell_ma5_break = True              # продавать при пробое MA5 вниз
+        self.sell_ma5_fraction = 0.4            # часть при пробое MA5
+        self.sell_ma20_break = True             # продавать всё при пробое MA20 вниз
+
         self._load_state()
-        
+        self.start_trading()
         logger.info(f"💰 VirtualTrader инициализирован. Баланс: {self.balance:,.0f} ₽")
-    
+
+    def _get_history_df(self, ticker: str, days: int = 30) -> Optional[pd.DataFrame]:
+        """Получает исторические цены и возвращает DataFrame с индикаторами."""
+        now = datetime.now()
+        # Проверяем кэш
+        if ticker in self.price_history_cache:
+            cache_time, df = self.price_history_cache[ticker]
+            if (now - cache_time).total_seconds() < self.history_cache_ttl:
+                return df
+
+        # Запрашиваем через stock_provider
+        history = self.stock_provider.get_history(ticker, days=days)
+        if not history or len(history) < 20:
+            return None
+
+        df = pd.DataFrame(history)
+        df.set_index('time', inplace=True)
+        df.sort_index(inplace=True)
+
+        # Рассчитываем индикаторы
+        df['MA5'] = df['close'].rolling(window=5).mean()
+        df['MA20'] = df['close'].rolling(window=20).mean()
+
+        # RSI
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        df['RSI'] = 100 - (100 / (1 + rs))
+
+        # Сохраняем в кэш
+        self.price_history_cache[ticker] = (now, df)
+        return df
+
+    # def _check_technical_filters(self, ticker: str, current_price: float) -> tuple[bool, float, str]:
+    #     """
+    #     Проверяет технические фильтры для входа.
+    #     Возвращает (разрешена_покупка, техническая_уверенность_0_1, причина_отказа).
+    #     """
+    #     df = self._get_history_df(ticker)
+    #     if df is None or df.empty:
+    #         return False, 0.0, "нет данных"
+
+    #     last = df.iloc[-1]
+    #     ma5 = last.get('MA5')
+    #     ma20 = last.get('MA20')
+    #     rsi = last.get('RSI')
+
+    #     if pd.isna(ma5) or pd.isna(ma20) or pd.isna(rsi):
+    #         return False, 0.0, "недостаточно данных для индикаторов"
+
+    #     trend_ok = (current_price > ma20) or (ma5 > ma20)
+    #     rsi_ok = rsi < 70
+
+    #     tech_conf = 0.0
+    #     reasons = []
+    #     if trend_ok:
+    #         tech_conf += 0.5
+    #     else:
+    #         reasons.append("тренд")
+    #     if rsi_ok:
+    #         tech_conf += 0.5
+    #     else:
+    #         reasons.append("RSI")
+
+    #     allow = trend_ok and rsi_ok
+    #     reason_str = ", ".join(reasons) if reasons else "все ок"
+    #     return allow, tech_conf, reason_str
+
+    def _check_technical_filters(self, ticker: str, current_price: float) -> tuple[bool, float, str]:
+        """
+        Упрощённая проверка: только RSI < 70 (не перекупленность).
+        Тренд игнорируем для агрессивной торговли.
+        """
+        df = self._get_history_df(ticker)
+        if df is None or df.empty:
+            return False, 0.0, "нет данных"
+
+        last = df.iloc[-1]
+        rsi = last.get('RSI')
+
+        if pd.isna(rsi):
+            return False, 0.0, "нет RSI"
+
+        # Условие: RSI < 70
+        rsi_ok = rsi < 70
+
+        # Техническая уверенность: 1.0 если RSI ок, иначе 0.0
+        tech_conf = 1.0 if rsi_ok else 0.0
+        reason = "" if rsi_ok else "RSI перекуплен"
+
+        return rsi_ok, tech_conf, reason
+
     def start_trading(self):
         """Запускает автономную торговлю"""
         self.is_trading = True
@@ -89,79 +194,94 @@ class VirtualTrader:
         logger.info(f"✅ Торговый цикл завершён. Баланс: {self.balance:,.0f} ₽")
 
     def _execute_trades(self, analysis: Dict):
-        """Выполняет сделки на основе анализа ИИ с диверсификацией"""
+        """Выполняет сделки на основе анализа ИИ – агрессивная версия с тех. фильтрами."""
         
         current_prices = self._get_current_prices()
         if not current_prices:
             logger.warning("Нет текущих цен, пропускаем торговлю")
             return
 
-        # Собираем рекомендации из top_picks и главной
-        recommendations = []
+        # Собираем кандидатов (до 7)
+        candidates = []
 
-        # 1. Добавляем все top_picks
-        for pick in analysis.get('top_picks', []):
+        # Из top_picks (если есть)
+        for pick in analysis.get('top_picks', [])[:7]:
             ticker = pick.get('ticker')
             action = pick.get('action', 'HOLD')
             confidence = pick.get('confidence', 0.5)
-            if action == 'BUY' and ticker in current_prices:
-                recommendations.append((ticker, confidence))
+            if action in ('BUY', 'HOLD') and ticker in current_prices:
+                candidates.append((ticker, confidence, action))
 
-        # 2. Добавляем главную рекомендацию, если её нет в списке
+        # Добавляем главную рекомендацию, если её нет
         main_ticker = analysis.get('top_pick')
         main_action = analysis.get('action')
         main_conf = analysis.get('confidence', 0.5)
-        if (main_action == 'BUY' and main_ticker and 
+        if (main_action in ('BUY', 'HOLD') and main_ticker and 
             main_ticker in current_prices and 
-            not any(t for t, _ in recommendations if t == main_ticker)):
-            recommendations.append((main_ticker, main_conf))
+            not any(t for t, _, _ in candidates if t == main_ticker)):
+            candidates.append((main_ticker, main_conf, main_action))
 
-        if not recommendations:
-            logger.info("Нет рекомендаций BUY, пропускаем")
+        if not candidates:
+            logger.info("Нет кандидатов для торговли")
             return
 
-        # Докупка при HOLD с уверенностью > 0.8 (усиление позиции)
-        for pick in analysis.get('top_picks', []):
-            ticker = pick.get('ticker')
-            action = pick.get('action', 'HOLD')
-            confidence = pick.get('confidence', 0.5)
-            if action == 'HOLD' and confidence > 0.8 and ticker in current_prices:
-                # Докупаем, но с уменьшенным весом (например, 30% от обычного)
-                self._buy(ticker, current_prices[ticker], confidence * 0.7, max_amount=self.balance * 0.1)
+        # Сортируем по уверенности
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        candidates = candidates[:7]
 
-        main_action = analysis.get('action')
-        main_conf = analysis.get('confidence', 0.5)
-        if main_action == 'HOLD' and main_conf > 0.8 and main_ticker in current_prices:
-            self._buy(main_ticker, current_prices[main_ticker], main_conf * 0.7, max_amount=self.balance * 0.1)
+        # === РАСПРЕДЕЛЕНИЕ КАПИТАЛА ===
+        buy_candidates = [(t, c) for t, c, a in candidates if a == 'BUY' and c >= self.min_confidence]
+        hold_candidates = [(t, c) for t, c, a in candidates if a == 'HOLD' and c >= 0.8]
 
-        # Сортируем по убыванию уверенности и берём топ‑3
-        recommendations.sort(key=lambda x: x[1], reverse=True)
-        recommendations = recommendations[:5]
+        total_conf_buy = sum(c for _, c in buy_candidates)
+        total_conf_hold = sum(c for _, c in hold_candidates)
 
-        # Нормируем уверенности (сумма = 1) для распределения капитала
-        total_conf = sum(conf for _, conf in recommendations)
-        if total_conf == 0:
-            return
-
-        # Доступный для инвестиций капитал (не более 70% свободных средств)
-        invest_capital = self.balance * 0.7
-        if invest_capital < 1000:  # слишком мало
+        invest_capital = self.balance * 0.8
+        if invest_capital < 1000:
             logger.info("Слишком мало средств для инвестиций")
             return
 
-        # Распределяем капитал пропорционально уверенности
-        allocations = []
-        for ticker, conf in recommendations:
-            share = conf / total_conf
-            amount = invest_capital * share
-            allocations.append((ticker, amount, conf))
+        # === ПОКУПКИ ПО BUY ===
+        if buy_candidates:
+            for ticker, conf in buy_candidates:
+                price = current_prices[ticker]
 
-        # Покупаем по очереди
-        for ticker, amount, conf in allocations:
-            price = current_prices[ticker]
-            self._buy(ticker, price, conf, amount)
+                # --- ТЕХНИЧЕСКИЙ ФИЛЬТР ---
+                allow, tech_conf, reason = self._check_technical_filters(ticker, price)
+                if not allow:
+                    logger.info(f"⏸️ {ticker}: пропущен (тех. фильтры: {reason})")
+                    continue
+                # Корректируем уверенность
+                adj_conf = (conf + tech_conf) / 2.0
+                # Доля от invest_capital на основе исходной уверенности
+                share = conf / total_conf_buy if total_conf_buy else 0
+                base_amount = invest_capital * share
+                # Корректируем сумму пропорционально отношению уверенностей
+                amount = base_amount * (adj_conf / conf) if conf > 0 else base_amount
+                logger.debug(f"{ticker}: BUY orig_conf={conf:.2f}, tech_conf={tech_conf:.2f}, adj_conf={adj_conf:.2f}, amount={amount:,.0f}")
+                self._buy(ticker, price, adj_conf, max_amount=amount)
 
-        # Проверка стоп‑лоссов и тейк‑профитов
+        # === ДОКУПКИ ПО HOLD ===
+        if hold_candidates:
+            hold_budget = invest_capital * 0.2
+            for ticker, conf in hold_candidates:
+                if ticker not in self.portfolio:
+                    continue
+                price = current_prices[ticker]
+
+                # --- ТЕХНИЧЕСКИЙ ФИЛЬТР (для докупки тоже применяем) ---
+                allow, tech_conf, reason = self._check_technical_filters(ticker, price)
+                if not allow:
+                    logger.info(f"⏸️ {ticker} (докупка): пропущен (тех. фильтры: {reason})")
+                    continue
+                adj_conf = (conf + tech_conf) / 2.0
+                share = conf / total_conf_hold if total_conf_hold else 0
+                base_amount = hold_budget * share
+                amount = base_amount * (adj_conf / conf) if conf > 0 else base_amount
+                logger.debug(f"{ticker}: HOLD orig_conf={conf:.2f}, tech_conf={tech_conf:.2f}, adj_conf={adj_conf:.2f}, amount={amount:,.0f}")
+                self._buy(ticker, price, adj_conf, max_amount=amount)
+
+        # Проверка стоп-лоссов и тейк-профитов
         self._check_positions(current_prices)
 
     def _process_recommendation(self, ticker: str, action: str, price: float, confidence: float):
@@ -184,7 +304,7 @@ class VirtualTrader:
         
         current_position_value = self.portfolio.get(ticker, {}).get('shares', 0) * price
         if current_position_value >= max_position_value:
-            logger.info(f"⏸️ {ticker}:已达 максимальный размер позиции")
+            logger.info(f"⏸️ {ticker}:достигнут максимальный размер позиции")
             return
 
         # Определяем доступную сумму для этой сделки
@@ -239,42 +359,49 @@ class VirtualTrader:
         }
         self.trades.append(trade)
 
+        db = services.db()
+        if db:
+            db.save_trade(trade)
+
         logger.info(f"🟢 BUY {shares} {ticker} @ {price:.2f} = {cost:,.0f} ₽ (fee: {fee:.0f})")
 
-    def _sell(self, ticker: str, price: float, confidence: float):
-        """Продаёт акции"""
-        
+    def _sell(self, ticker: str, price: float, confidence: float, reason: str = 'manual', shares: Optional[int] = None, sell_all: bool = False):
         if ticker not in self.portfolio:
             return
-        
-        shares = self.portfolio[ticker]['shares']
+
+        total_shares = self.portfolio[ticker]['shares']
         avg_price = self.portfolio[ticker]['avg_price']
-        
-        # Рассчитываем сколько продавать (на основе уверенности)
-        if confidence > 0.9:
-            sell_shares = shares  # Продаём всё
-        elif confidence > 0.7:
-            sell_shares = int(shares * 0.7)  # Продаём 70%
+
+        if sell_all:
+            sell_shares = total_shares
+        elif shares is not None:
+            sell_shares = min(shares, total_shares)
         else:
-            sell_shares = int(shares * 0.5)  # Продаём 50%
-        
+            # Старая логика на основе confidence (оставляем для обратной совместимости)
+            if confidence > 0.9:
+                sell_shares = total_shares
+            elif confidence > 0.7:
+                sell_shares = int(total_shares * 0.7)
+            else:
+                sell_shares = int(total_shares * 0.5)
+
         if sell_shares == 0:
             return
-        
-        # Совершаем продажу
+
         revenue = sell_shares * price
         fee = revenue * self.trade_fee
         profit = (price - avg_price) * sell_shares
-        
+
         self.balance += (revenue - fee)
-        
+
         # Обновляем портфель
-        if sell_shares >= shares:
+        if sell_shares >= total_shares:
             del self.portfolio[ticker]
+            # Очищаем данные трейлинга и уровней
+            self.highest_price.pop(ticker, None)
         else:
             self.portfolio[ticker]['shares'] -= sell_shares
-        
-        # Записываем сделку
+
         trade = {
             'timestamp': datetime.now(),
             'ticker': ticker,
@@ -285,39 +412,89 @@ class VirtualTrader:
             'fee': fee,
             'profit': profit,
             'confidence': confidence,
-            'balance_after': self.balance
+            'balance_after': self.balance,
+            'reason': reason,
         }
         self.trades.append(trade)
-        
-        profit_emoji = "🟢" if profit > 0 else "🔴"
-        logger.info(f"{profit_emoji} SELL {sell_shares} {ticker} @ {price:.2f} = {revenue:,.0f} ₽ (profit: {profit:+,.0f})")
-        
-        # Обновляем дневную прибыль
-        self.daily_pnl += profit
-    
+
+        db = services.db()
+        if db:
+            db.save_trade(trade)
+
+        logger.info(f"{'🟢' if profit>0 else '🔴'} SELL {sell_shares} {ticker} @ {price:.2f} = {revenue:,.0f} ₽ (profit: {profit:+,.0f}) reason: {reason}")
+
     def _check_positions(self, current_prices: Dict):
-        """Проверяет текущие позиции на стоп-лосс и тейк-профит"""
-        
+        """
+        Проверяет позиции на предмет продажи по техническим сигналам:
+        - RSI > 80 (перекупленность) → продажа части
+        - цена ниже MA5 → продажа части
+        - цена ниже MA20 → продажа всей позиции
+        Также оставляем трейлинг-стоп и обычный стоп-лосс.
+        """
         for ticker, position in list(self.portfolio.items()):
             if ticker not in current_prices:
                 continue
-            
+
             current_price = current_prices[ticker]
             avg_price = position['avg_price']
-            
-            # Расчёт доходности
-            profit_percent = (current_price - avg_price) / avg_price * 100
-            
-            # Стоп-лосс -5%
-            if profit_percent < -5:
-                logger.info(f"🛑 Стоп-лосс для {ticker}: {profit_percent:.1f}%")
-                self._sell(ticker, current_price, 1.0)
-            
-            # Тейк-профит +15%
-            elif profit_percent > 15:
-                logger.info(f"🎯 Тейк-профит для {ticker}: {profit_percent:.1f}%")
-                self._sell(ticker, current_price, 1.0)
-    
+            shares = position['shares']
+
+            # Получаем технические индикаторы
+            df = self._get_history_df(ticker)
+            if df is None or df.empty:
+                continue
+
+            last = df.iloc[-1]
+            ma5 = last.get('MA5')
+            ma20 = last.get('MA20')
+            rsi = last.get('RSI')
+
+            if pd.isna(ma5) or pd.isna(ma20) or pd.isna(rsi):
+                continue
+
+            # --- 1. Технические сигналы на продажу ---
+            # Приоритет: MA20 (полная продажа) -> MA5 -> RSI
+
+            # Пробой MA20 (ниже)
+            if self.sell_ma20_break and current_price < ma20:
+                logger.info(f"📉 {ticker}: пробой MA20 ({ma20:.2f}), продажа всей позиции")
+                self._sell(ticker, current_price, 1.0, reason='ma20_break', sell_all=True)
+                continue  # позиция закрыта, дальше не проверяем
+
+            # Пробой MA5 (ниже)
+            if self.sell_ma5_break and current_price < ma5:
+                shares_to_sell = int(shares * self.sell_ma5_fraction)
+                if shares_to_sell > 0:
+                    logger.info(f"📉 {ticker}: пробой MA5 ({ma5:.2f}), продажа {shares_to_sell} шт. ({self.sell_ma5_fraction*100:.0f}%)")
+                    self._sell(ticker, current_price, 0.8, reason='ma5_break', shares=shares_to_sell)
+                # после частичной продажи позиция ещё остаётся, проверяем дальше (но RSI уже не проверяем, если не хотим)
+
+            # Перекупленность RSI
+            if rsi > self.sell_rsi_overbought:
+                shares_to_sell = int(shares * self.sell_rsi_fraction)
+                if shares_to_sell > 0:
+                    logger.info(f"📈 {ticker}: RSI={rsi:.1f} > {self.sell_rsi_overbought}, продажа {shares_to_sell} шт. ({self.sell_rsi_fraction*100:.0f}%)")
+                    self._sell(ticker, current_price, 0.7, reason='rsi_overbought', shares=shares_to_sell)
+
+            # --- 2. Трейлинг-стоп (оставляем как есть) ---
+            if self.use_trailing_stop:
+                if ticker not in self.highest_price:
+                    self.highest_price[ticker] = current_price
+                else:
+                    self.highest_price[ticker] = max(self.highest_price[ticker], current_price)
+
+                trailing_stop_level = self.highest_price[ticker] * (1 - self.trailing_stop_pct / 100)
+                if current_price <= trailing_stop_level:
+                    logger.info(f"📉 Трейлинг-стоп для {ticker} при {current_price:.2f} (макс {self.highest_price[ticker]:.2f})")
+                    self._sell(ticker, current_price, 1.0, reason='trailing_stop', sell_all=True)
+                    continue
+
+            # --- 3. Обычный стоп-лосс (оставляем) ---
+            profit_pct = (current_price - avg_price) / avg_price * 100
+            if profit_pct < -5:
+                logger.info(f"🛑 Стоп-лосс для {ticker}: {profit_pct:.1f}%")
+                self._sell(ticker, current_price, 1.0, reason='stop_loss', sell_all=True)
+
     def _get_current_prices(self) -> Dict[str, float]:
         """Получает текущие цены всех активов в портфеле"""
         prices = {}
@@ -403,7 +580,8 @@ class VirtualTrader:
             'portfolio': self.portfolio,
             'trades': self.trades[-100:],  # Последние 100 сделок
             'performance_history': self.performance_history[-50:],
-            'last_save': datetime.now().isoformat()
+            'last_save': datetime.now().isoformat(),
+            'is_trading': self.is_trading,
         }
         
         os.makedirs('data', exist_ok=True)
@@ -423,7 +601,8 @@ class VirtualTrader:
                 self.portfolio = state.get('portfolio', {})
                 self.trades = state.get('trades', [])
                 self.performance_history = state.get('performance_history', [])
-                
+                self.is_trading = state.get('is_trading', False)
+
                 logger.info(f"📂 Загружено состояние: баланс {self.balance:,.0f} ₽")
         except Exception as e:
             logger.error(f"Ошибка загрузки состояния: {e}")
@@ -466,9 +645,9 @@ class VirtualTrader:
             lines.append("\n*Последние сделки:*")
             for trade in self.trades[-3:]:
                 if isinstance(trade['timestamp'], str):
-                    date = datetime.fromisoformat(trade['timestamp']).strftime('%H:%M')
+                    date = datetime.fromisoformat(trade['timestamp']).strftime('%d.%m.%y %H:%M')
                 else:
-                    date = trade['timestamp'].strftime('%H:%M')
+                    date = trade['timestamp'].strftime('%d.%m.%y %H:%M')
                     
                 if trade['action'] == 'BUY':
                     lines.append(f"🟢 {date} BUY {trade['shares']} {trade['ticker']} @ {trade['price']:.2f}")

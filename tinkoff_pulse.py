@@ -37,21 +37,17 @@ class TinkoffPulseParser:
             'Origin': 'https://www.tinkoff.ru',
             'Referer': 'https://www.tinkoff.ru/invest/social/feed/'
         }
-        # Добавляем Authorization только если токен передан и не пустой
         if token and token.strip():
             self.headers['Authorization'] = f'Bearer {token}'
 
     def get_feed(self, limit: int = 20, offset: int = 0, retries: int = 2) -> List[PulsePost]:
-        """
-        Получает ленту постов (основная лента) с повторными попытками.
-        """
+        """Получает основную ленту постов."""
         for base_url in self.base_urls:
             url = f"{base_url}/feed"
-            params = {'limit': limit, 'offset': offset}
+            params = {'limit': limit, 'offset': offset, 'sort': 'recent'}
             try:
                 logger.info(f"Пробуем URL: {url}")
                 response = requests.get(url, headers=self.headers, params=params, timeout=10)
-                
                 if response.status_code == 200:
                     data = response.json()
                     return self._parse_posts(data)
@@ -65,9 +61,7 @@ class TinkoffPulseParser:
         return []
 
     def get_posts_by_ticker(self, ticker: str, limit: int = 20) -> List[PulsePost]:
-        """
-        Получает посты, упоминающие конкретный тикер.
-        """
+        """Получает посты по конкретному тикеру."""
         for base_url in self.base_urls:
             url = f"{base_url}/instruments/{ticker}/posts"
             params = {'limit': limit, 'offset': 0}
@@ -86,12 +80,24 @@ class TinkoffPulseParser:
                 logger.error(f"Ошибка при запросе {ticker}: {e}")
         return []
 
+    def get_trending_topics(self) -> List[Dict]:
+        """Получает трендовые темы (тикеры, которые сейчас популярны)."""
+        for base_url in self.base_urls:
+            url = f"{base_url}/trending"
+            try:
+                response = requests.get(url, headers=self.headers, timeout=10)
+                if response.status_code == 200:
+                    data = response.json()
+                    # Предполагаем структуру: data['payload']['topics'] или что-то подобное
+                    topics = data.get('payload', {}).get('topics', [])
+                    return topics
+            except Exception as e:
+                logger.error(f"Ошибка при получении трендов: {e}")
+        return []
+
     def _parse_posts(self, data: Dict) -> List[PulsePost]:
-        """
-        Парсит ответ API и возвращает список постов.
-        """
+        """Парсит ответ API и возвращает список постов."""
         posts = []
-        # Разные возможные структуры ответа
         items = []
         if 'payload' in data and 'items' in data['payload']:
             items = data['payload']['items']
@@ -110,7 +116,6 @@ class TinkoffPulseParser:
                 date_str = item.get('createdAt', '')
                 date = self._parse_date(date_str)
 
-                # Извлекаем тикеры
                 tickers = []
                 if 'instruments' in item:
                     for instr in item['instruments']:
@@ -118,14 +123,7 @@ class TinkoffPulseParser:
                         if ticker:
                             tickers.append(ticker)
 
-                # Простой анализ сентимента
-                sentiment_score = self._simple_sentiment(text)
-                if sentiment_score > 0.2:
-                    sentiment_category = 'positive'
-                elif sentiment_score < -0.2:
-                    sentiment_category = 'negative'
-                else:
-                    sentiment_category = 'neutral'
+                sentiment_score, sentiment_category = self._analyze_sentiment(text)
 
                 post = PulsePost(
                     id=post_id,
@@ -143,19 +141,56 @@ class TinkoffPulseParser:
                 logger.debug(f"Ошибка парсинга поста: {e}")
         return posts
 
+    def _analyze_sentiment(self, text: str) -> tuple:
+        """Анализирует тональность текста, возвращает (score, category)."""
+        text_lower = text.lower()
+        positive_words = ['растет', 'вырастет', 'прибыль', 'дивиденды', 'успех', 'дорожает', 'buy', 'long']
+        negative_words = ['падает', 'упадет', 'убыток', 'проблемы', 'кризис', 'дешевеет', 'sell', 'short']
+        pos_count = sum(1 for w in positive_words if w in text_lower)
+        neg_count = sum(1 for w in negative_words if w in text_lower)
+
+        if pos_count + neg_count > 0:
+            score = (pos_count - neg_count) / (pos_count + neg_count)
+        else:
+            score = 0.0
+
+        if score > 0.2:
+            category = 'positive'
+        elif score < -0.2:
+            category = 'negative'
+        else:
+            category = 'neutral'
+
+        return score, category
+
     def _parse_date(self, date_str: str) -> datetime:
         try:
             return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
         except:
             return datetime.now()
 
-    def _simple_sentiment(self, text: str) -> float:
-        """Простой анализ на основе ключевых слов."""
-        text_lower = text.lower()
-        positive = ['растет', 'вырастет', 'прибыль', 'дивиденды', 'успех', 'дорожает', 'buy', 'long']
-        negative = ['падает', 'упадет', 'убыток', 'проблемы', 'кризис', 'дешевеет', 'sell', 'short']
-        pos_count = sum(1 for w in positive if w in text_lower)
-        neg_count = sum(1 for w in negative if w in text_lower)
-        if pos_count + neg_count == 0:
-            return 0
-        return (pos_count - neg_count) / (pos_count + neg_count)
+    def collect_all(self, limit_per_feed: int = 20, max_total: int = 50) -> List[PulsePost]:
+        """Собирает посты из разных источников (лента + по тикерам из трендов)."""
+        all_posts = []
+        seen_ids = set()
+
+        # Основная лента
+        feed_posts = self.get_feed(limit=limit_per_feed)
+        for post in feed_posts:
+            if post.id not in seen_ids:
+                seen_ids.add(post.id)
+                all_posts.append(post)
+
+        # Трендовые темы
+        trends = self.get_trending_topics()
+        for trend in trends[:5]:
+            ticker = trend.get('ticker')
+            if ticker:
+                ticker_posts = self.get_posts_by_ticker(ticker, limit=10)
+                for post in ticker_posts:
+                    if post.id not in seen_ids and len(all_posts) < max_total:
+                        seen_ids.add(post.id)
+                        all_posts.append(post)
+
+        logger.info(f"Собрано {len(all_posts)} уникальных постов из Tinkoff Пульс")
+        return all_posts
