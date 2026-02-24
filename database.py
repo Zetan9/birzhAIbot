@@ -8,6 +8,7 @@ from typing import List, Dict, Optional
 from news_parser import NewsItem
 import json
 import logging
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 

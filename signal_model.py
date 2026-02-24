@@ -12,12 +12,12 @@ MODEL_PATH = 'models/moex_signal_model.pkl'
 FEATURE_NAMES = ['price', 'delta_p', 'volume', 'buy_pct', 'sell_pct', 'hour', 'day_of_week']
 
 def prepare_features(df):
-    """
-    Преобразует DataFrame с колонками из таблицы moex_signals
-    в матрицу признаков для модели.
-    """
     df = df.copy()
-    df['signal_time'] = pd.to_datetime(df['signal_time'])
+    # Парсим дату в формате ISO (без микросекунд)
+    df['signal_time'] = pd.to_datetime(df['signal_time'], format='ISO8601', errors='coerce')
+    # Удаляем строки с нераспознанной датой (если вдруг)
+    df = df.dropna(subset=['signal_time'])
+    
     df['hour'] = df['signal_time'].dt.hour
     df['day_of_week'] = df['signal_time'].dt.dayofweek
 
