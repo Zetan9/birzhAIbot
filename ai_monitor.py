@@ -11,7 +11,6 @@ import json
 import os
 from config import TINKOFF_TOKEN
 import services
-=======
 # import ollama
 
 logger = logging.getLogger(__name__)
