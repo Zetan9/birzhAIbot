@@ -11,7 +11,7 @@ import pandas as pd
 import numpy as np
 from backtester import Backtester
 import services
-import ollama
+# import ollama
 import json
 import sqlite3
 import httpx

@@ -13,7 +13,7 @@ import time
 import base64
 import re
 from news_parser import NewsItem
-import ollama
+# import ollama
 import pandas as pd
 import services
 import httpx
