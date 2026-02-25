@@ -10,12 +10,8 @@ from typing import Dict, List, Any, Optional
 import json
 import os
 from config import TINKOFF_TOKEN
-<<<<<<< HEAD
-import ollama
 import services
-=======
 # import ollama
->>>>>>> 64db4d961435dbe3784ef5542382d684c1870c6e
 
 logger = logging.getLogger(__name__)
 
