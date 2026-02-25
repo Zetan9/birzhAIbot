@@ -431,12 +431,12 @@ async def ratings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def analyze_ticker_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Глубокий ИИ-анализ конкретного тикера."""
-    # if os.getenv("DISABLE_AI", "false").lower() == "true":
-    #     await context.bot.send_message(
-    #         chat_id=update.effective_chat.id,
-    #         text="🤖 ИИ временно отключён. Анализ недоступен."
-    #     )
-    #     return
+    if os.getenv("DISABLE_AI", "false").lower() == "true":
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="🤖 ИИ временно отключён. Анализ недоступен."
+        )
+        return
     
     # Проверяем наличие пользователя перед логированием
     if not update.effective_user:
@@ -714,12 +714,12 @@ async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def advice_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """ИИ-рекомендации."""
-    # if os.getenv("DISABLE_AI", "false").lower() == "true":
-    #     await context.bot.send_message(
-    #         chat_id=update.effective_chat.id,
-    #         text="🤖 ИИ временно отключён. Попробуйте позже."
-    #     )
-    #     return
+    if os.getenv("DISABLE_AI", "false").lower() == "true":
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="🤖 ИИ временно отключён. Попробуйте позже."
+        )
+        return
     
     if not update.effective_chat:
         return

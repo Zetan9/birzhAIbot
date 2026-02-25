@@ -19,7 +19,7 @@ import services
 import httpx
 from config import OLLAMA_HOST
 
-# DISABLE_AI = os.getenv("DISABLE_AI", "false").lower() == "false"
+DISABLE_AI = os.getenv("DISABLE_AI", "false").lower() == "false"
 
 logger = logging.getLogger(__name__)
 
@@ -113,9 +113,9 @@ class AIAdvisor:
         Отправляет запрос к Ollama и ожидает JSON-ответ.
         Возвращает распарсенный JSON или None при ошибке.
         """
-        # if DISABLE_AI:
-        #     logger.info("AI disabled, returning None")
-        #     return None
+        if DISABLE_AI:
+            logger.info("AI disabled, returning None")
+            return None
 
         url = f"{OLLAMA_HOST}/api/chat"
         payload = {
